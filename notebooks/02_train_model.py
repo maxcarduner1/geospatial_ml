@@ -1,10 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC ## 02 — Train LightGBM Model & Register to Unity Catalog
+# MAGIC ## 02 — Train LightGBM Model with Feature Store
 # MAGIC
-# MAGIC Trains a `LGBMRegressor` to predict RSRP signal strength from spatial, temporal,
-# MAGIC and network features. Logs the experiment to MLflow and registers the model to
-# MAGIC Unity Catalog for governed downstream consumption.
+# MAGIC Uses the **Feature Engineering client** to build a training set from the `signal_features`
+# MAGIC feature table, trains a `LGBMRegressor`, and logs the model with `fe.log_model()` so that
+# MAGIC feature lookup metadata is packaged with the model for downstream scoring and serving.
 
 # COMMAND ----------
 
@@ -15,11 +15,13 @@ dbutils.widgets.text("schema",  "geospatial_analytics")
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA  = dbutils.widgets.get("schema")
 
-MODEL_NAME = f"{CATALOG}.{SCHEMA}.signal_strength_predictor"
+MODEL_NAME    = f"{CATALOG}.{SCHEMA}.signal_strength_predictor"
+FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.signal_features"
 
-print(f"Catalog    : {CATALOG}")
-print(f"Schema     : {SCHEMA}")
-print(f"Model name : {MODEL_NAME}")
+print(f"Catalog       : {CATALOG}")
+print(f"Schema        : {SCHEMA}")
+print(f"Model name    : {MODEL_NAME}")
+print(f"Feature table : {FEATURE_TABLE}")
 
 # COMMAND ----------
 
@@ -32,7 +34,6 @@ from mlflow.tracking import MlflowClient
 
 mlflow.set_registry_uri("databricks-uc")
 
-# Resolve current user for experiment path
 username = spark.sql("SELECT current_user()").collect()[0][0]
 experiment_path = f"/Users/{username}/ml_geospatial_signal_strength"
 mlflow.set_experiment(experiment_path)
@@ -42,23 +43,16 @@ print(f"Experiment      : {experiment_path}")
 
 # COMMAND ----------
 
-# MAGIC %md ### 2. Load training data
+# MAGIC %md ### 2. Build training set with Feature Engineering client
+# MAGIC
+# MAGIC `FeatureLookup` defines which features to pull from the feature table.
+# MAGIC `fe.create_training_set()` joins them onto the observations DataFrame automatically.
 
 # COMMAND ----------
 
-import pandas as pd
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 
-train_sdf = spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_training_data")
-train_pdf = train_sdf.toPandas()
-
-print(f"Training rows: {len(train_pdf):,}")
-display(train_sdf.limit(5))
-
-# COMMAND ----------
-
-# MAGIC %md ### 3. Prepare features and target
-
-# COMMAND ----------
+fe = FeatureEngineeringClient()
 
 feature_cols = [
     "latitude",
@@ -74,10 +68,45 @@ feature_cols = [
     "wifi_rssi_filled",
 ]
 
-target_col = "rsrp"
+feature_lookups = [
+    FeatureLookup(
+        table_name=FEATURE_TABLE,
+        feature_names=feature_cols,
+        lookup_key="signal_id",
+    )
+]
 
-X = train_pdf[feature_cols]
-y = train_pdf[target_col]
+# COMMAND ----------
+
+# Load training observations (signal_id + rsrp, filtered to train split)
+train_obs_df = (
+    spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_observations")
+    .filter("split = 'train'")
+    .select("signal_id", "rsrp")
+)
+
+print(f"Training observations: {train_obs_df.count():,}")
+
+# Create training set — auto-joins features from feature table
+training_set = fe.create_training_set(
+    df=train_obs_df,
+    feature_lookups=feature_lookups,
+    label="rsrp",
+    exclude_columns=["signal_id"],
+)
+
+training_pdf = training_set.load_df().toPandas()
+print(f"Training set loaded: {training_pdf.shape}")
+display(training_set.load_df().limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md ### 3. Prepare features and target
+
+# COMMAND ----------
+
+X = training_pdf[feature_cols]
+y = training_pdf["rsrp"]
 
 print(f"Feature matrix: {X.shape}")
 print(f"Target stats:\n{y.describe()}")
@@ -99,16 +128,15 @@ print(f"Val:   {X_val.shape[0]:,} rows")
 
 # COMMAND ----------
 
-# MAGIC %md ### 5. Train LightGBM regressor with MLflow tracking
+# MAGIC %md ### 5. Train LightGBM regressor and log with Feature Store
 
 # COMMAND ----------
 
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from mlflow.models import infer_signature
 import numpy as np
 
-with mlflow.start_run(run_name="lightgbm_signal_strength") as run:
+with mlflow.start_run(run_name="lightgbm_signal_strength_fe") as run:
 
     # --- Model definition ---
     model = LGBMRegressor(
@@ -145,15 +173,14 @@ with mlflow.start_run(run_name="lightgbm_signal_strength") as run:
     mlflow.log_metric("val_mae", mae)
     mlflow.log_metric("val_r2", r2)
 
-    # --- Log model with signature ---
-    signature = infer_signature(X_train, model.predict(X_train))
-    input_example = X_train.iloc[:3]
-
-    mlflow.lightgbm.log_model(
-        model,
+    # --- Log model with Feature Engineering client ---
+    # This packages feature lookup metadata with the model so that
+    # fe.score_batch() and serving endpoints can auto-retrieve features.
+    fe.log_model(
+        model=model,
         artifact_path="model",
-        signature=signature,
-        input_example=input_example,
+        flavor=mlflow.lightgbm,
+        training_set=training_set,
         registered_model_name=MODEL_NAME,
     )
 
@@ -169,7 +196,6 @@ with mlflow.start_run(run_name="lightgbm_signal_strength") as run:
 
 client = MlflowClient()
 
-# Get the latest version number
 latest_version = max(
     client.search_model_versions(f"name='{MODEL_NAME}'"),
     key=lambda v: int(v.version),
@@ -202,6 +228,8 @@ display(spark.createDataFrame(importance_df))
 # MAGIC |------|-------|
 # MAGIC | Model | LightGBM Regressor |
 # MAGIC | Target | RSRP signal strength (dBm) |
+# MAGIC | Logged with | `fe.log_model()` (Feature Engineering client) |
+# MAGIC | Feature Table | `signal_features` (auto-lookup at scoring/serving) |
 # MAGIC | Registry | Unity Catalog |
 # MAGIC | Model Name | `cmegdemos_catalog.geospatial_analytics.signal_strength_predictor` |
 # MAGIC | Alias | Champion |

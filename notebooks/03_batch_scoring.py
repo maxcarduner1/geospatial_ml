@@ -1,9 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC ## 03 — Batch Scoring: Signal Strength Predictions
+# MAGIC ## 03 — Batch Scoring with Feature Store
 # MAGIC
-# MAGIC Loads the Champion model from Unity Catalog and scores the holdout set in batch.
-# MAGIC Evaluates prediction quality and persists results for downstream analysis.
+# MAGIC Uses `fe.score_batch()` to score the holdout set. The Feature Engineering client
+# MAGIC automatically looks up features from the `signal_features` table — the scoring
+# MAGIC DataFrame only needs to contain the lookup key (`signal_id`).
 
 # COMMAND ----------
 
@@ -22,68 +23,61 @@ print(f"Model name : {MODEL_NAME}")
 
 # COMMAND ----------
 
-# MAGIC %md ### 1. Load Champion model from Unity Catalog
+# MAGIC %md ### 1. Load holdout observations
+# MAGIC
+# MAGIC Only `signal_id` is needed for feature lookup — `rsrp` is kept for evaluation.
 
 # COMMAND ----------
 
+holdout_df = (
+    spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_observations")
+    .filter("split = 'holdout'")
+    .select("signal_id", "rsrp")
+)
+
+print(f"Holdout rows: {holdout_df.count():,}")
+display(holdout_df.limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md ### 2. Score with `fe.score_batch()`
+# MAGIC
+# MAGIC The model was logged with `fe.log_model()`, so it contains feature lookup metadata.
+# MAGIC `score_batch()` automatically joins features from the `signal_features` table
+# MAGIC using `signal_id`, then runs the model to produce predictions.
+
+# COMMAND ----------
+
+from databricks.feature_engineering import FeatureEngineeringClient
 import mlflow
 
 mlflow.set_registry_uri("databricks-uc")
 
+fe = FeatureEngineeringClient()
+
 model_uri = f"models:/{MODEL_NAME}@Champion"
-model = mlflow.pyfunc.load_model(model_uri)
 
-print(f"Loaded model: {model_uri}")
-print(f"Model metadata: {model.metadata}")
+predictions_df = fe.score_batch(
+    model_uri=model_uri,
+    df=holdout_df,
+)
 
-# COMMAND ----------
-
-# MAGIC %md ### 2. Load holdout data
-
-# COMMAND ----------
-
-holdout_sdf = spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_holdout_data")
-holdout_pdf = holdout_sdf.toPandas()
-
-print(f"Holdout rows: {len(holdout_pdf):,}")
-display(holdout_sdf.limit(5))
+print(f"Predictions generated via fe.score_batch()")
+display(predictions_df.limit(5))
 
 # COMMAND ----------
 
-# MAGIC %md ### 3. Generate predictions
-
-# COMMAND ----------
-
-feature_cols = [
-    "latitude",
-    "longitude",
-    "h3_index",
-    "distance_to_nearest_tower",
-    "nearest_tower_type_enc",
-    "nearest_tower_freq_band_enc",
-    "tower_count_within_500m",
-    "network_type_enc",
-    "hour_of_day",
-    "day_of_week",
-    "wifi_rssi_filled",
-]
-
-X_holdout = holdout_pdf[feature_cols]
-holdout_pdf["predicted_rsrp"] = model.predict(X_holdout)
-
-print(f"Predictions generated for {len(holdout_pdf):,} rows")
-
-# COMMAND ----------
-
-# MAGIC %md ### 4. Evaluate prediction quality
+# MAGIC %md ### 3. Evaluate prediction quality
 
 # COMMAND ----------
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import numpy as np
 
-y_actual = holdout_pdf["rsrp"]
-y_pred = holdout_pdf["predicted_rsrp"]
+results_pdf = predictions_df.toPandas()
+
+y_actual = results_pdf["rsrp"]
+y_pred = results_pdf["prediction"]
 
 rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
 mae = mean_absolute_error(y_actual, y_pred)
@@ -95,38 +89,36 @@ print(f"Holdout R²   : {r2:.4f}")
 
 # COMMAND ----------
 
-# MAGIC %md ### 5. Actual vs Predicted comparison
+# MAGIC %md ### 4. Actual vs Predicted comparison
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F
 
-results_sdf = spark.createDataFrame(holdout_pdf)
-
 # Summary statistics
 display(
-    results_sdf.select(
+    predictions_df.select(
         F.avg("rsrp").alias("avg_actual_rsrp"),
-        F.avg("predicted_rsrp").alias("avg_predicted_rsrp"),
-        F.expr("corr(rsrp, predicted_rsrp)").alias("correlation"),
+        F.avg("prediction").alias("avg_predicted_rsrp"),
+        F.expr("corr(rsrp, prediction)").alias("correlation"),
     )
 )
 
 # COMMAND ----------
 
-# Scatter-friendly view: actual vs predicted
+# Scatter-friendly view: actual vs predicted with key features
 display(
-    results_sdf.select("rsrp", "predicted_rsrp", "distance_to_nearest_tower", "network_type")
+    predictions_df.select("rsrp", "prediction", "distance_to_nearest_tower", "network_type_enc")
 )
 
 # COMMAND ----------
 
-# MAGIC %md ### 6. Persist predictions
+# MAGIC %md ### 5. Persist predictions
 
 # COMMAND ----------
 
 (
-    results_sdf.write
+    predictions_df.write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
@@ -139,9 +131,9 @@ print(f"Predictions saved to: {CATALOG}.{SCHEMA}.signal_predictions")
 
 # MAGIC %md ### Summary
 # MAGIC
-# MAGIC | Metric | Value |
-# MAGIC |--------|-------|
-# MAGIC | RMSE | `{rmse:.4f}` |
-# MAGIC | MAE | `{mae:.4f}` |
-# MAGIC | R² | `{r2:.4f}` |
-# MAGIC | Output Table | `signal_predictions` |
+# MAGIC | Item | Value |
+# MAGIC |------|-------|
+# MAGIC | Scoring method | `fe.score_batch()` — automatic feature lookup |
+# MAGIC | Input | `signal_id` (lookup key) + `rsrp` (for evaluation) |
+# MAGIC | Feature source | `signal_features` table (auto-joined) |
+# MAGIC | Output table | `signal_predictions` |

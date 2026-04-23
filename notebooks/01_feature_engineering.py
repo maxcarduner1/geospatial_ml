@@ -225,7 +225,7 @@ encoded_df = (
 
 # COMMAND ----------
 
-# MAGIC %md ### 7. Select final feature columns and split train/holdout
+# MAGIC %md ### 7. Assign unique signal_id and select final columns
 
 # COMMAND ----------
 
@@ -245,15 +245,15 @@ feature_cols = [
 
 target_col = "rsrp"
 
-# Keep original columns for context + feature columns + target
-final_df = encoded_df.select(
-    *feature_cols,
-    F.col(target_col),
-    # Keep raw columns for interpretability
-    F.col("network_type"),
-    F.col("nearest_tower_type"),
-    F.col("nearest_tower_freq_band"),
-    F.col("timestamp"),
+# Add a unique signal_id as primary key for the feature table
+final_df = (
+    encoded_df
+    .withColumn("signal_id", F.monotonically_increasing_id())
+    .select(
+        "signal_id",
+        *feature_cols,
+        F.col(target_col),
+    )
 )
 
 print(f"Final feature set: {final_df.count():,} rows, {len(feature_cols)} features")
@@ -261,43 +261,80 @@ display(final_df.limit(10))
 
 # COMMAND ----------
 
-# MAGIC %md ### 8. 80/20 train/holdout split and persist
+# MAGIC %md ### 8. Register feature table with Feature Engineering client
+# MAGIC
+# MAGIC Uses `FeatureEngineeringClient.create_table()` to register features in Unity Catalog
+# MAGIC as a governed Feature Table with `signal_id` as the primary key.
 
 # COMMAND ----------
 
-train_df, holdout_df = final_df.randomSplit([0.8, 0.2], seed=42)
+from databricks.feature_engineering import FeatureEngineeringClient
 
-print(f"Training rows : {train_df.count():,}")
-print(f"Holdout rows  : {holdout_df.count():,}")
+fe = FeatureEngineeringClient()
+
+FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.signal_features"
+
+# Features only (no target column)
+features_df = final_df.select("signal_id", *feature_cols)
+
+# Drop and recreate to ensure clean state for demo re-runs
+spark.sql(f"DROP TABLE IF EXISTS `{CATALOG}`.`{SCHEMA}`.signal_features")
+
+fe.create_table(
+    name=FEATURE_TABLE,
+    primary_keys=["signal_id"],
+    df=features_df,
+    description="Spatial, temporal, and network features for signal strength prediction. Keyed by signal_id.",
+)
+
+print(f"Feature table created: {FEATURE_TABLE}")
+print(f"  Primary key: signal_id")
+print(f"  Features: {len(feature_cols)}")
+
+# Enable Change Data Feed (required for online table sync via TRIGGERED publish mode)
+spark.sql(f"ALTER TABLE `{CATALOG}`.`{SCHEMA}`.signal_features SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
+print("  CDF enabled for online table sync")
 
 # COMMAND ----------
 
+# MAGIC %md ### 9. Create observations table (labels + split)
+# MAGIC
+# MAGIC Separate table with just the lookup key (`signal_id`), target (`rsrp`),
+# MAGIC and a `split` flag so training and holdout can be filtered independently.
+
+# COMMAND ----------
+
+# 80/20 split via random assignment
+observations_df = (
+    final_df
+    .select("signal_id", "rsrp")
+    .withColumn("rand", F.rand(seed=42))
+    .withColumn("split", F.when(F.col("rand") < 0.8, "train").otherwise("holdout"))
+    .drop("rand")
+)
+
+train_count = observations_df.filter(F.col("split") == "train").count()
+holdout_count = observations_df.filter(F.col("split") == "holdout").count()
+
+print(f"Training rows : {train_count:,}")
+print(f"Holdout rows  : {holdout_count:,}")
+
 (
-    train_df.write
+    observations_df.write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"`{CATALOG}`.`{SCHEMA}`.signal_training_data")
+    .saveAsTable(f"`{CATALOG}`.`{SCHEMA}`.signal_observations")
 )
 
-(
-    holdout_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"`{CATALOG}`.`{SCHEMA}`.signal_holdout_data")
-)
-
-print("Tables saved:")
-print(f"  {CATALOG}.{SCHEMA}.signal_training_data")
-print(f"  {CATALOG}.{SCHEMA}.signal_holdout_data")
+print(f"Observations table saved: {CATALOG}.{SCHEMA}.signal_observations")
 
 # COMMAND ----------
 
 # MAGIC %md ### Summary
 # MAGIC
-# MAGIC | Table | Description |
-# MAGIC |-------|-------------|
-# MAGIC | `cell_towers` | Synthesized cell tower reference data (8 towers) |
-# MAGIC | `signal_training_data` | 80% split — ML-ready features + RSRP target |
-# MAGIC | `signal_holdout_data` | 20% split — for batch scoring evaluation |
+# MAGIC | Table | Type | Description |
+# MAGIC |-------|------|-------------|
+# MAGIC | `cell_towers` | Reference | Synthesized cell tower reference data (8 towers) |
+# MAGIC | `signal_features` | **Feature Table** | 11 features keyed by `signal_id`, registered with FE client |
+# MAGIC | `signal_observations` | Labels | `signal_id` + `rsrp` target + `split` (train/holdout) |
