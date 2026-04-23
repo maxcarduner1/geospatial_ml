@@ -1,54 +1,65 @@
 # Geospatial ML — Signal Strength Prediction on Databricks
 
-End-to-end Databricks demo that predicts **RSRP cellular signal strength** (dBm) for geographic locations relative to synthetic cell towers. Features include **H3 spatial indexing**, distances and tower density, temporal signals, and encoded network metadata. Models are trained with **LightGBM**, tracked in **MLflow**, and registered in **Unity Catalog**.
+**Repository:** [github.com/maxcarduner1/geospatial_ml](https://github.com/maxcarduner1/geospatial_ml)
+
+End-to-end Databricks demo that predicts **RSRP cellular signal strength** (dBm) from handset readings relative to **synthesized cell towers** (Haversine distance, tower density). Features use **H3** indexing (resolution 9), temporal attributes, and encoded network fields. Models are trained with **LightGBM**, packaged with the **Databricks Feature Engineering** client (`FeatureLookup` + `fe.log_model()`), tracked in **MLflow**, and registered in **Unity Catalog**.
+
+## Architecture
+
+1. **Notebook 01** reads raw `signal_points`, engineers features, writes reference **`cell_towers`** (8 towers near Chandler Fashion Center), registers a governed **`signal_features`** feature table (primary key `signal_id`), and writes **`signal_observations`** (`signal_id`, `rsrp`, `split` = train/holdout).
+2. **Notebook 02** builds a training set via **`create_training_set()`**, trains LightGBM, and logs/registers the model with feature metadata for UC.
+3. **Notebook 03** scores holdout rows with **`fe.score_batch()`** so features are joined automatically from `signal_features`.
+4. **Notebook 04** (manual) provisions **Model Serving** and shows sample requests.
 
 ## What’s in this repo
 
 | Piece | Purpose |
 |--------|---------|
-| [`databricks.yml`](databricks.yml) | Databricks Asset Bundle (DAB): serverless job pipeline and workspace target |
-| [`notebooks/01_feature_engineering.py`](notebooks/01_feature_engineering.py) | Builds ML-ready training/holdout tables from `signal_points` |
-| [`notebooks/02_train_model.py`](notebooks/02_train_model.py) | Trains LightGBM, logs runs, registers `signal_strength_predictor` to UC |
-| [`notebooks/03_batch_scoring.py`](notebooks/03_batch_scoring.py) | Loads Champion model, batch-scores holdout data |
-| [`notebooks/04_model_serving.py`](notebooks/04_model_serving.py) | Creates/updates a Model Serving endpoint and sample inference (run interactively; not in the job) |
+| [`databricks.yml`](databricks.yml) | Databricks Asset Bundle (DAB): serverless job pipeline, `fevm-cmegdemos` workspace target |
+| [`notebooks/01_feature_engineering.py`](notebooks/01_feature_engineering.py) | Raw data → `cell_towers`, `signal_features`, `signal_observations` |
+| [`notebooks/02_train_model.py`](notebooks/02_train_model.py) | Feature Engineering training set → LightGBM → `fe.log_model()` → UC registry |
+| [`notebooks/03_batch_scoring.py`](notebooks/03_batch_scoring.py) | Holdout via `signal_observations` → `fe.score_batch()` → metrics + persisted predictions |
+| [`notebooks/04_model_serving.py`](notebooks/04_model_serving.py) | Serving endpoint + inference example (**interactive only**, not part of the job) |
 
 ## Data & Unity Catalog
 
-- **Workspace:** Field Engineering CMEG demos — `https://fevm-cmegdemos.cloud.databricks.com` (CLI profile `fevm-cmegdemos`).
-- **Catalog / schema:** `cmegdemos_catalog.geospatial_analytics`
-- **Source table:** `signal_points`
-- **Derived tables:** training and holdout tables produced by notebook 01 (e.g. `signal_training_data`, `signal_holdout_data`).
-- **Registered model:** `{catalog}.{schema}.signal_strength_predictor` with MLflow registry URI `databricks-uc`.
+| Asset | Description |
+|-------|-------------|
+| **Workspace** | [fevm-cmegdemos](https://fevm-cmegdemos.cloud.databricks.com) — CLI profile `fevm-cmegdemos` |
+| **Catalog.schema** | `cmegdemos_catalog.geospatial_analytics` (override via bundle variables) |
+| **`signal_points`** | Source telemetry |
+| **`cell_towers`** | Synthetic tower reference for spatial features |
+| **`signal_features`** | UC feature table (`signal_id` PK); CDF enabled for online patterns |
+| **`signal_observations`** | Labels + 80/20 train/holdout split |
+| **Registered model** | `{catalog}.{schema}.signal_strength_predictor` — MLflow registry URI `databricks-uc` |
 
 ## Prerequisites
 
-- [Databricks CLI](https://docs.databricks.com/dev-tools/cli/index.html) with auth for profile `fevm-cmegdemos`.
-- Unity Catalog access to `cmegdemos_catalog.geospatial_analytics` and MLflow UC model registry permissions.
+- [Databricks CLI](https://docs.databricks.com/dev-tools/cli/index.html) authenticated as profile `fevm-cmegdemos`.
+- UC access to the catalog/schema, Feature Engineering / feature table permissions, and MLflow model registry rights.
 
-## Deploy and run the pipeline
-
-From this directory:
+## Deploy and run
 
 ```bash
+cd ml_geospatial   # or your clone path
+
 databricks bundle deploy --profile fevm-cmegdemos
 databricks bundle run ml_geospatial_pipeline --profile fevm-cmegdemos
 ```
 
-Override catalog/schema if needed via bundle variables (defined in `databricks.yml`).
+Optional: set `catalog` and `schema` in `databricks.yml` variables or pass overrides supported by your CLI version for multi-environment demos.
 
-The job runs three tasks in order:
+### Job tasks
 
-1. **feature_engineering** — features + labels for regression on RSRP  
-2. **train_model** — LightGBM + MLflow + UC registration  
-3. **batch_scoring** — Champion model, holdout evaluation, persisted predictions  
+1. **feature_engineering** — Delta + Feature Table registration  
+2. **train_model** — LightGBM, MLflow, UC model with packaged feature specs  
+3. **batch_scoring** — Champion model, `score_batch`, evaluation output  
 
-Job dependencies (`lightgbm`, `mlflow`, `pandas`, etc.) are declared in the bundle environment spec (serverless client `"5"`).
+Serverless environment uses client `"5"` with dependencies including `lightgbm`, `mlflow`, `scikit-learn`, `databricks-sdk`, and **`databricks-feature-engineering`**.
 
 ## Model serving (interactive)
 
-After the Champion alias exists on the UC model, open **`04_model_serving.py`** in the workspace. It provisions or updates a **serverless Model Serving** endpoint (optional scale-to-zero) and shows how to issue inference requests against the endpoint.
-
-See [Create and manage model serving endpoints](https://docs.databricks.com/aws/en/machine-learning/model-serving/create-manage-serving-endpoints) for operations and monitoring.
+After the **Champion** alias exists on the UC model, run **`04_model_serving.py`** in the workspace to create or update a serverless endpoint (demo-friendly scale-to-zero). See [Model Serving — create and manage endpoints](https://docs.databricks.com/aws/en/machine-learning/model-serving/create-manage-serving-endpoints).
 
 ## References
 
