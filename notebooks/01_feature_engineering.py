@@ -1,16 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC ## 01 — Feature Engineering: Signal Strength Prediction
+# MAGIC ## 01 — Feature Engineering: H3 Hex-Level Signal Strength
 # MAGIC
-# MAGIC Builds ML-ready training and holdout tables from the raw `signal_points` table.
+# MAGIC Builds ML-ready training and holdout tables from the raw `signal_points` table,
+# MAGIC aggregated at **H3 resolution 10** hex level.
 # MAGIC
-# MAGIC **Features engineered:**
-# MAGIC - Spatial: distance to nearest cell tower, tower density, nearest tower type/frequency
-# MAGIC - H3: hexagonal spatial index at resolution 9
-# MAGIC - Temporal: hour of day, day of week
-# MAGIC - Network: encoded network type, cell type, connectivity type
+# MAGIC **Features engineered (per hex):**
+# MAGIC - Spatial: avg distance to nearest cell tower, avg tower density, dominant tower type/frequency
+# MAGIC - Location: hex centroid latitude/longitude
+# MAGIC - Temporal: avg hour of day, avg day of week
+# MAGIC - Network: dominant network type, avg WiFi RSSI
+# MAGIC - Volume: measurement count per hex
 # MAGIC
-# MAGIC **Target:** RSRP signal strength (dBm) — continuous regression
+# MAGIC **Target:** Average RSRP signal strength per hex (dBm) — continuous regression
 
 # COMMAND ----------
 
@@ -65,15 +67,17 @@ display(clean_df.limit(5))
 
 # COMMAND ----------
 
-# MAGIC %md ### 3. H3 spatial indexing
+# MAGIC %md ### 3. H3 spatial indexing (resolution 10)
 
 # COMMAND ----------
 
 h3_df = clean_df.withColumn(
     "h3_index",
-    F.expr("h3_longlatash3(latitude, longitude, 9)")
+    F.expr("h3_longlatash3(longitude, latitude, 10)")
 )
 
+n_hexes = h3_df.select("h3_index").distinct().count()
+print(f"Distinct H3 res-10 hexes: {n_hexes}")
 display(h3_df.select("latitude", "longitude", "h3_index", "rsrp").limit(5))
 
 # COMMAND ----------
@@ -225,46 +229,55 @@ encoded_df = (
 
 # COMMAND ----------
 
-# MAGIC %md ### 7. Assign unique signal_id and select final columns
+# MAGIC %md ### 7. Aggregate per H3 hex
+# MAGIC
+# MAGIC Roll up per-measurement features to the hex level:
+# MAGIC - Continuous features → mean
+# MAGIC - Categorical features → mode (most frequent value)
+# MAGIC - Target (RSRP) → mean
 
 # COMMAND ----------
 
-feature_cols = [
-    "latitude",
-    "longitude",
-    "h3_index",
-    "distance_to_nearest_tower",
-    "nearest_tower_type_enc",
-    "nearest_tower_freq_band_enc",
-    "tower_count_within_500m",
-    "network_type_enc",
-    "hour_of_day",
-    "day_of_week",
-    "wifi_rssi_filled",
-]
+# Mode UDF for categorical columns (returns most frequent integer value)
+from pyspark.sql.types import IntegerType
 
-target_col = "rsrp"
+mode_udf = F.udf(lambda vals: max(set(vals), key=vals.count) if vals else -1, IntegerType())
 
-# Add a unique signal_id as primary key for the feature table
-final_df = (
+hex_df = (
     encoded_df
-    .withColumn("signal_id", F.monotonically_increasing_id())
-    .select(
-        "signal_id",
-        *feature_cols,
-        F.col(target_col),
+    .groupBy("h3_index")
+    .agg(
+        # Location: centroid of measurements
+        F.avg("latitude").alias("latitude"),
+        F.avg("longitude").alias("longitude"),
+        # Spatial: averages
+        F.avg("distance_to_nearest_tower").alias("avg_distance_to_nearest_tower"),
+        F.avg("tower_count_within_500m").alias("avg_tower_count_within_500m"),
+        # Categorical: mode (most frequent)
+        mode_udf(F.collect_list("nearest_tower_type_enc")).alias("dominant_tower_type_enc"),
+        mode_udf(F.collect_list("nearest_tower_freq_band_enc")).alias("dominant_freq_band_enc"),
+        mode_udf(F.collect_list("network_type_enc")).alias("dominant_network_type_enc"),
+        # Temporal: averages
+        F.avg("hour_of_day").alias("avg_hour_of_day"),
+        F.avg("day_of_week").alias("avg_day_of_week"),
+        # Network
+        F.avg("wifi_rssi_filled").alias("avg_wifi_rssi"),
+        # Volume
+        F.count("*").alias("measurement_count"),
+        # Target
+        F.avg("rsrp").alias("avg_rsrp"),
     )
 )
 
-print(f"Final feature set: {final_df.count():,} rows, {len(feature_cols)} features")
-display(final_df.limit(10))
+print(f"Hex-level rows: {hex_df.count()}")
+display(hex_df.limit(10))
 
 # COMMAND ----------
 
 # MAGIC %md ### 8. Register feature table with Feature Engineering client
 # MAGIC
-# MAGIC Uses `FeatureEngineeringClient.create_table()` to register features in Unity Catalog
-# MAGIC as a governed Feature Table with `signal_id` as the primary key.
+# MAGIC Uses `FeatureEngineeringClient.create_table()` to register hex-level features in
+# MAGIC Unity Catalog as a governed Feature Table with `h3_index` as the primary key.
 
 # COMMAND ----------
 
@@ -274,24 +287,38 @@ fe = FeatureEngineeringClient()
 
 FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.signal_features"
 
+feature_cols = [
+    "latitude",
+    "longitude",
+    "avg_distance_to_nearest_tower",
+    "dominant_tower_type_enc",
+    "dominant_freq_band_enc",
+    "avg_tower_count_within_500m",
+    "dominant_network_type_enc",
+    "avg_hour_of_day",
+    "avg_day_of_week",
+    "avg_wifi_rssi",
+    "measurement_count",
+]
+
 # Features only (no target column)
-features_df = final_df.select("signal_id", *feature_cols)
+features_only_df = hex_df.select("h3_index", *feature_cols)
 
 # Drop and recreate to ensure clean state for demo re-runs
 spark.sql(f"DROP TABLE IF EXISTS `{CATALOG}`.`{SCHEMA}`.signal_features")
 
 fe.create_table(
     name=FEATURE_TABLE,
-    primary_keys=["signal_id"],
-    df=features_df,
-    description="Spatial, temporal, and network features for signal strength prediction. Keyed by signal_id.",
+    primary_keys=["h3_index"],
+    df=features_only_df,
+    description="Hex-level (H3 res 10) spatial, temporal, and network features for signal strength prediction.",
 )
 
 print(f"Feature table created: {FEATURE_TABLE}")
-print(f"  Primary key: signal_id")
+print(f"  Primary key: h3_index")
 print(f"  Features: {len(feature_cols)}")
 
-# Enable Change Data Feed (required for online table sync via TRIGGERED publish mode)
+# Enable Change Data Feed (required for online table sync)
 spark.sql(f"ALTER TABLE `{CATALOG}`.`{SCHEMA}`.signal_features SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
 print("  CDF enabled for online table sync")
 
@@ -299,15 +326,16 @@ print("  CDF enabled for online table sync")
 
 # MAGIC %md ### 9. Create observations table (labels + split)
 # MAGIC
-# MAGIC Separate table with just the lookup key (`signal_id`), target (`rsrp`),
-# MAGIC and a `split` flag so training and holdout can be filtered independently.
+# MAGIC Separate table with the lookup key (`h3_index`), target (`avg_rsrp`),
+# MAGIC and a `split` flag. **Split is at the hex level** — entire hexes go
+# MAGIC into either train or holdout to avoid data leakage.
 
 # COMMAND ----------
 
-# 80/20 split via random assignment
+# 80/20 split at the hex level
 observations_df = (
-    final_df
-    .select("signal_id", "rsrp")
+    hex_df
+    .select("h3_index", "avg_rsrp")
     .withColumn("rand", F.rand(seed=42))
     .withColumn("split", F.when(F.col("rand") < 0.8, "train").otherwise("holdout"))
     .drop("rand")
@@ -316,8 +344,8 @@ observations_df = (
 train_count = observations_df.filter(F.col("split") == "train").count()
 holdout_count = observations_df.filter(F.col("split") == "holdout").count()
 
-print(f"Training rows : {train_count:,}")
-print(f"Holdout rows  : {holdout_count:,}")
+print(f"Training hexes : {train_count:,}")
+print(f"Holdout hexes  : {holdout_count:,}")
 
 (
     observations_df.write
@@ -336,5 +364,5 @@ print(f"Observations table saved: {CATALOG}.{SCHEMA}.signal_observations")
 # MAGIC | Table | Type | Description |
 # MAGIC |-------|------|-------------|
 # MAGIC | `cell_towers` | Reference | Synthesized cell tower reference data (8 towers) |
-# MAGIC | `signal_features` | **Feature Table** | 11 features keyed by `signal_id`, registered with FE client |
-# MAGIC | `signal_observations` | Labels | `signal_id` + `rsrp` target + `split` (train/holdout) |
+# MAGIC | `signal_features` | **Feature Table** | 11 hex-level features keyed by `h3_index` (res 10) |
+# MAGIC | `signal_observations` | Labels | `h3_index` + `avg_rsrp` target + `split` (train/holdout) |

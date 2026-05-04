@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Signal Strength Prediction</title>
+
+  <!-- MapLibre GL -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+  <!-- deck.gl standalone bundle -->
+  <script src="https://cdn.jsdelivr.net/npm/deck.gl@9.1.7/dist.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --mono: "SF Mono","Fira Code","Fira Mono","Roboto Mono",monospace;
+    }
+
+    html, body {
+      height: 100%; width: 100%; overflow: hidden;
+      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    button { cursor: pointer; border: none; font-family: inherit; }
+
+    /* ── Layout ── */
+    .app { display: flex; height: 100%; }
+    .sidebar {
+      width: 380px; min-width: 380px; background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .sidebar-hd { padding: 20px 20px 16px; border-bottom: 1px solid var(--border); }
+    .sidebar-hd h1 { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+    .sidebar-hd p  { font-size: 13px; color: var(--muted); line-height: 1.4; }
+    .sidebar-bd { flex: 1; overflow-y: auto; padding: 16px 20px; }
+    .map-wrap { flex: 1; position: relative; }
+    #deck-canvas { position: absolute; inset: 0; }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600;
+      transition: all .15s ease;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-full { width: 100%; justify-content: center; }
+
+    /* ── Cards ── */
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+    .card {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px;
+    }
+    .card .lbl {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--muted); margin-bottom: 4px;
+    }
+    .card .val { font-size: 22px; font-weight: 700; font-family: var(--mono); }
+    .card .unit { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 2px; }
+
+    /* ── Legend ── */
+    .legend { margin-bottom: 16px; }
+    .legend h3 {
+      font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--muted); margin-bottom: 8px;
+    }
+    .legend-bar {
+      height: 12px; border-radius: 6px; margin-bottom: 6px;
+      background: linear-gradient(to right, #800026, #BD0026, #E31A1C, #FC4E2A, #FD8D3C, #FEB24C, #FED976, #22c55e);
+    }
+    .legend-labels {
+      display: flex; justify-content: space-between;
+      font-size: 11px; color: var(--muted); font-family: var(--mono);
+    }
+
+    /* ── Panel (hex detail) ── */
+    .panel {
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px; margin-bottom: 16px;
+    }
+    .panel h3 { font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+    .row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 13px;
+    }
+    .row:last-child { border-bottom: none; }
+    .row .k { color: var(--muted); }
+    .row .v { font-family: var(--mono); font-weight: 600; }
+    .row .v.good { color: var(--green); }
+    .row .v.bad { color: var(--red); }
+    .row .v.warn { color: var(--yellow); }
+    .divider {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+      color: var(--muted); padding: 8px 0 4px; border-bottom: none;
+    }
+
+    /* ── Comparison bars ── */
+    .bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+    .bar-lbl { width: 65px; flex-shrink: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    .bar-track { flex: 1; height: 18px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; transition: width .4s ease; }
+    .bar-fill.actual { background: var(--accent); }
+    .bar-fill.predicted { background: var(--green); }
+    .bar-val { width: 65px; text-align: right; font-family: var(--mono); font-weight: 600; font-size: 12px; flex-shrink: 0; }
+
+    /* ── Section header ── */
+    .sec { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 0 10px; }
+
+    /* ── Tower list ── */
+    .towers { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+    .tw {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 12px; font-size: 12px;
+    }
+    .tw-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .tw-dot.Macro { background: #f59e0b; }
+    .tw-dot.Small { background: #8b5cf6; }
+    .tw-name { font-weight: 600; font-size: 13px; }
+    .tw-meta { color: var(--muted); margin-top: 2px; }
+
+    /* ── Overlays ── */
+    .overlay {
+      position: absolute; inset: 0; display: flex; align-items: center;
+      justify-content: center; background: rgba(15,23,42,.8); z-index: 100;
+    }
+    .spinner {
+      width: 40px; height: 40px; border: 3px solid var(--border);
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-banner {
+      background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.3);
+      border-radius: 8px; padding: 12px 14px; font-size: 13px; color: #fca5a5; margin-bottom: 12px;
+    }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+      border-radius: 20px; font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .badge.loading { background: rgba(59,130,246,.15); color: #60a5fa; }
+    .badge.ready   { background: rgba(34,197,94,.15);  color: #4ade80; }
+    .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+    /* ── deck.gl tooltip ── */
+    .deck-tooltip {
+      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      background: #1e293b !important; border: 1px solid #334155 !important;
+      border-radius: 10px !important; padding: 16px !important;
+      color: #f1f5f9 !important; font-size: 13px !important;
+      box-shadow: 0 8px 30px rgba(0,0,0,.5) !important;
+      pointer-events: none; max-width: 310px; line-height: 1.55;
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-hd">
+      <h1>Signal Strength Prediction</h1>
+      <p>H3 hex-level RSRP predictions near Chandler Fashion Center, AZ. LightGBM model served via Databricks Model Serving with Feature Store online lookup.</p>
+    </div>
+    <div class="sidebar-bd" id="sidebar-bd"></div>
+  </div>
+
+  <!-- Map -->
+  <div class="map-wrap">
+    <div id="load-overlay" class="overlay"><div class="spinner"></div></div>
+    <div id="pred-overlay" class="overlay" style="display:none">
+      <div style="text-align:center">
+        <div class="spinner" style="margin:0 auto 12px"></div>
+        <div style="font-size:14px;color:#94a3b8">Calling serving endpoint...</div>
+      </div>
+    </div>
+    <div id="deck-canvas"></div>
+  </div>
+</div>
+
+<script>
+// ===================================================================
+// State
+// ===================================================================
+const S = {
+  hexes: [],        // ALL hexes with features + predictions
+  towers: [],
+  loading: true,
+  predicting: false,
+  error: null,
+  selectedHex: null, // hex object currently selected in sidebar
+};
+
+// ===================================================================
+// Utility
+// ===================================================================
+function rsrpColor(rsrp, lo, hi) {
+  // Red (weak) → Yellow → Green (strong), matching YlOrRd-ish palette
+  const t = Math.max(0, Math.min(1, (rsrp - lo) / (hi - lo)));
+  let r, g, b;
+  if (t < 0.25) {
+    r = 128 + Math.round(t * 4 * 61);  // 128→189
+    g = Math.round(t * 4 * 38);         // 0→38
+    b = Math.round(t * 4 * 38);         // 0→38
+  } else if (t < 0.5) {
+    const s = (t - 0.25) * 4;
+    r = 189 + Math.round(s * 63);       // 189→252
+    g = 38 + Math.round(s * 40);        // 38→78
+    b = 38 - Math.round(s * 10);        // 38→28
+  } else if (t < 0.75) {
+    const s = (t - 0.5) * 4;
+    r = 252 - Math.round(s * 5);        // 252→247
+    g = 78 + Math.round(s * 100);       // 78→178
+    b = 28 - Math.round(s * 17);        // 28→11
+  } else {
+    const s = (t - 0.75) * 4;
+    r = 247 - Math.round(s * 213);      // 247→34
+    g = 178 + Math.round(s * 19);       // 178→197
+    b = 11 + Math.round(s * 83);        // 11→94
+  }
+  return [r, g, b];
+}
+
+function rsrpRange() {
+  const vals = S.hexes.filter(h => h.actual_rsrp != null).map(h => h.actual_rsrp);
+  if (!vals.length) return { lo: -120, hi: -60 };
+  return { lo: Math.min(...vals), hi: Math.max(...vals) };
+}
+
+function errClass(e) {
+  if (e == null) return '';
+  return Math.abs(e) < 3 ? 'good' : Math.abs(e) < 6 ? 'warn' : 'bad';
+}
+function errClr(e) {
+  if (e == null) return '#94a3b8';
+  return Math.abs(e) < 3 ? '#22c55e' : Math.abs(e) < 6 ? '#eab308' : '#ef4444';
+}
+function fmt(v, d) { return v == null ? '--' : v.toFixed(d || 1); }
+
+function metrics() {
+  const p = S.hexes.filter(h => h.predicted_rsrp != null && h.actual_rsrp != null);
+  if (!p.length) return null;
+  let sae = 0, sse = 0, sa = 0, sp = 0;
+  for (const h of p) {
+    const e = h.predicted_rsrp - h.actual_rsrp;
+    sae += Math.abs(e); sse += e * e;
+    sa += h.actual_rsrp; sp += h.predicted_rsrp;
+  }
+  return {
+    count: p.length,
+    mae: sae / p.length,
+    rmse: Math.sqrt(sse / p.length),
+    avgA: sa / p.length,
+    avgP: sp / p.length,
+  };
+}
+
+// ===================================================================
+// deck.gl map
+// ===================================================================
+let deckgl;
+
+function initMap() {
+  deckgl = new deck.DeckGL({
+    container: 'deck-canvas',
+    mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+    initialViewState: {
+      longitude: -111.8713, latitude: 33.3062,
+      zoom: 15, pitch: 45, bearing: -15,
+    },
+    controller: true,
+    layers: [],
+    getTooltip: tooltip,
+  });
+}
+
+function tooltip({ object }) {
+  if (!object) return null;
+  const d = object;
+
+  // Determine if this is a tower or hex
+  if (d.tower_id != null) {
+    return {
+      html: '<b>Tower ' + d.tower_id + '</b><br>' +
+            d.tower_type + ' | ' + d.freq_band + '<br>' +
+            '<span style="color:#94a3b8">' + d.tower_lat.toFixed(4) + ', ' + d.tower_lon.toFixed(4) + '</span>',
+      className: 'deck-tooltip',
+    };
+  }
+
+  const hasPred = d.predicted_rsrp != null;
+  const error = hasPred && d.actual_rsrp != null
+    ? Math.round((d.predicted_rsrp - d.actual_rsrp) * 100) / 100 : null;
+  const split = d.split || '—';
+
+  let h = '<div style="min-width:240px">';
+
+  // Header
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+  h += '<span style="font-weight:700;font-size:14px">H3 Hex</span>';
+  h += '<span style="font-size:10px;text-transform:uppercase;padding:2px 8px;border-radius:10px;' +
+       (hasPred ? 'background:rgba(34,197,94,.15);color:#4ade80">Predicted' : 'background:rgba(59,130,246,.15);color:#60a5fa">Unpredicted') +
+       '</span></div>';
+  h += '<div style="font-size:10px;color:#64748b;font-family:monospace;margin-bottom:10px">' + d.h3_hex + '</div>';
+
+  // Signal section
+  h += '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin-bottom:4px">Signal</div>';
+
+  if (d.actual_rsrp != null) {
+    h += '<div style="display:flex;justify-content:space-between;padding:2px 0">';
+    h += '<span style="color:#94a3b8">Actual RSRP</span>';
+    h += '<span style="font-family:monospace;font-weight:600">' + d.actual_rsrp.toFixed(1) + ' dBm</span></div>';
+  }
+
+  if (hasPred) {
+    h += '<div style="display:flex;justify-content:space-between;padding:2px 0">';
+    h += '<span style="color:#94a3b8">Predicted RSRP</span>';
+    h += '<span style="font-family:monospace;font-weight:600;color:#22c55e">' + d.predicted_rsrp.toFixed(1) + ' dBm</span></div>';
+
+    if (error != null) {
+      h += '<div style="display:flex;justify-content:space-between;padding:2px 0">';
+      h += '<span style="color:#94a3b8">Error</span>';
+      h += '<span style="font-family:monospace;font-weight:600;color:' + errClr(error) + '">';
+      h += (error > 0 ? '+' : '') + error.toFixed(2) + ' dBm</span></div>';
+    }
+  }
+
+  // Features section
+  h += '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin:8px 0 4px">Features</div>';
+
+  const feats = [
+    ['Nearest Tower', d.avg_distance_to_nearest_tower != null ? fmt(d.avg_distance_to_nearest_tower) + ' m' : '--'],
+    ['Tower Density', d.avg_tower_count_within_500m != null ? fmt(d.avg_tower_count_within_500m, 0) + ' / 500m' : '--'],
+    ['Network', d.network_type || '--'],
+    ['Tower Type', d.tower_type || '--'],
+    ['Freq Band', d.freq_band || '--'],
+    ['WiFi RSSI', d.avg_wifi_rssi != null ? fmt(d.avg_wifi_rssi) + ' dBm' : '--'],
+    ['Measurements', d.measurement_count != null ? d.measurement_count : '--'],
+  ];
+
+  for (const [k, v] of feats) {
+    h += '<div style="display:flex;justify-content:space-between;padding:2px 0">';
+    h += '<span style="color:#94a3b8">' + k + '</span>';
+    h += '<span style="font-family:monospace;font-weight:500">' + v + '</span></div>';
+  }
+
+  // Split + click hint
+  h += '<div style="margin-top:8px;font-size:11px;color:#64748b">';
+  h += 'Split: ' + split;
+  if (!hasPred) h += ' &middot; <em>Click to predict</em>';
+  h += '</div>';
+
+  h += '</div>';
+  return { html: h, className: 'deck-tooltip' };
+}
+
+function updateLayers() {
+  const range = rsrpRange();
+  const predictedCount = S.hexes.filter(h => h.predicted_rsrp != null).length;
+  const hasPreds = predictedCount > 0;
+
+  const hexLayer = new deck.PolygonLayer({
+    id: 'hexes',
+    data: S.hexes,
+    pickable: true,
+    filled: true,
+    stroked: true,
+    extruded: hasPreds,
+    elevationScale: hasPreds ? 4 : 0,
+    lineWidthMinPixels: 1,
+    getPolygon: d => d.boundary,
+    getFillColor: d => {
+      const val = d.predicted_rsrp != null ? d.predicted_rsrp : d.actual_rsrp;
+      if (val == null) return [59, 130, 246, 40];
+      const c = rsrpColor(val, range.lo, range.hi);
+      return [...c, d.predicted_rsrp != null ? 190 : 90];
+    },
+    getLineColor: d => {
+      const val = d.predicted_rsrp != null ? d.predicted_rsrp : d.actual_rsrp;
+      if (val == null) return [59, 130, 246, 60];
+      const c = rsrpColor(val, range.lo, range.hi);
+      return [...c, d.predicted_rsrp != null ? 220 : 110];
+    },
+    getElevation: d => {
+      if (!hasPreds || d.predicted_rsrp == null) return 0;
+      const t = (d.predicted_rsrp - range.lo) / (range.hi - range.lo);
+      return Math.max(0, t) * 50;
+    },
+    onClick: ({ object }) => {
+      if (object) handleHexClick(object);
+    },
+    updateTriggers: {
+      getFillColor: [predictedCount],
+      getLineColor: [predictedCount],
+      getElevation: [predictedCount],
+    },
+    transitions: { getFillColor: 300, getElevation: 500 },
+  });
+
+  const towerLayer = new deck.ScatterplotLayer({
+    id: 'towers',
+    data: S.towers,
+    pickable: true,
+    stroked: true,
+    filled: true,
+    radiusMinPixels: 6,
+    radiusMaxPixels: 12,
+    lineWidthMinPixels: 2,
+    getPosition: d => [d.tower_lon, d.tower_lat],
+    getFillColor: d => d.tower_type === 'macro' ? [245, 158, 11, 230] : [139, 92, 246, 230],
+    getLineColor: [255, 255, 255, 200],
+    getRadius: 30,
+  });
+
+  deckgl.setProps({ layers: [hexLayer, towerLayer] });
+}
+
+// ===================================================================
+// Sidebar
+// ===================================================================
+function renderSidebar() {
+  const el = document.getElementById('sidebar-bd');
+  const m = metrics();
+  const total = S.hexes.length;
+  const predicted = S.hexes.filter(h => h.predicted_rsrp != null).length;
+  const unpredicted = total - predicted;
+  const trainCount = S.hexes.filter(h => h.split === 'train').length;
+  const holdoutCount = S.hexes.filter(h => h.split === 'holdout').length;
+
+  let o = '';
+
+  // Error
+  if (S.error) o += '<div class="error-banner">' + S.error + '</div>';
+
+  // Badge
+  o += '<div style="margin-bottom:16px">';
+  if (S.loading) {
+    o += '<span class="badge loading"><span class="badge-dot"></span> Loading</span>';
+  } else {
+    o += '<span class="badge ready"><span class="badge-dot"></span> ' + predicted + ' / ' + total + ' predicted</span>';
+  }
+  o += '</div>';
+
+  // Stats
+  o += '<div class="cards">';
+  o += '<div class="card"><div class="lbl">Total Hexes</div><div class="val">' + total + '</div></div>';
+  o += '<div class="card"><div class="lbl">Predicted</div><div class="val">' + predicted + '</div></div>';
+  o += '<div class="card"><div class="lbl">Train</div><div class="val">' + trainCount + '</div></div>';
+  o += '<div class="card"><div class="lbl">Holdout</div><div class="val">' + holdoutCount + '</div></div>';
+  o += '</div>';
+
+  // Predict unpredicted button
+  if (unpredicted > 0) {
+    const dis = S.predicting || S.loading;
+    o += '<button class="btn btn-primary btn-full" id="btn-predict" style="margin-bottom:20px"' + (dis ? ' disabled' : '') + '>';
+    o += '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg> ';
+    o += (S.predicting ? 'Predicting...' : 'Predict Remaining ' + unpredicted + ' Hexes');
+    o += '</button>';
+  }
+
+  // Legend
+  o += '<div class="legend"><h3>RSRP Signal Strength</h3>';
+  o += '<div class="legend-bar"></div>';
+  o += '<div class="legend-labels"><span>-120 dBm (weak)</span><span>-90</span><span>-60 dBm (strong)</span></div></div>';
+
+  // Metrics
+  if (m) {
+    o += '<div class="panel"><h3>Prediction Metrics</h3>';
+    o += '<div class="row"><span class="k">Hexes Scored</span><span class="v">' + m.count + '</span></div>';
+    o += '<div class="row"><span class="k">RMSE</span><span class="v">' + m.rmse.toFixed(3) + ' dBm</span></div>';
+    o += '<div class="row"><span class="k">MAE</span><span class="v">' + m.mae.toFixed(3) + ' dBm</span></div>';
+    o += '<div class="row"><span class="k">Avg Actual</span><span class="v">' + m.avgA.toFixed(1) + ' dBm</span></div>';
+    o += '<div class="row"><span class="k">Avg Predicted</span><span class="v">' + m.avgP.toFixed(1) + ' dBm</span></div>';
+    o += '</div>';
+  }
+
+  // Selected hex detail
+  if (S.selectedHex) {
+    const d = S.selectedHex;
+    const hasPred = d.predicted_rsrp != null;
+    const error = hasPred && d.actual_rsrp != null
+      ? Math.round((d.predicted_rsrp - d.actual_rsrp) * 100) / 100 : null;
+
+    o += '<div class="panel"><h3>Selected Hex</h3>';
+    o += '<div class="row"><span class="k">H3 Index</span><span class="v" style="font-size:11px">' + d.h3_hex + '</span></div>';
+    o += '<div class="row"><span class="k">Location</span><span class="v" style="font-size:12px">' + fmt(d.latitude, 4) + ', ' + fmt(d.longitude, 4) + '</span></div>';
+    o += '<div class="row"><span class="k">Split</span><span class="v">' + (d.split || '--') + '</span></div>';
+
+    // Signal
+    o += '<div class="row divider">Signal</div>';
+    o += '<div class="row"><span class="k">Actual RSRP</span><span class="v">' + fmt(d.actual_rsrp) + ' dBm</span></div>';
+    o += '<div class="row"><span class="k">Predicted RSRP</span><span class="v ' + (hasPred ? 'good' : '') + '">' + fmt(d.predicted_rsrp) + ' dBm</span></div>';
+    if (error != null) {
+      o += '<div class="row"><span class="k">Error</span><span class="v ' + errClass(error) + '">' + (error > 0 ? '+' : '') + error.toFixed(2) + ' dBm</span></div>';
+    }
+
+    // Comparison bars
+    if (hasPred && d.actual_rsrp != null) {
+      const ap = Math.max(0, Math.min(100, ((d.actual_rsrp + 120) / 60) * 100));
+      const pp = Math.max(0, Math.min(100, ((d.predicted_rsrp + 120) / 60) * 100));
+      o += '<div style="margin-top:10px">';
+      o += '<div class="bar-row"><span class="bar-lbl">Actual</span><div class="bar-track"><div class="bar-fill actual" style="width:' + ap + '%"></div></div><span class="bar-val">' + d.actual_rsrp.toFixed(1) + '</span></div>';
+      o += '<div class="bar-row"><span class="bar-lbl">Predicted</span><div class="bar-track"><div class="bar-fill predicted" style="width:' + pp + '%"></div></div><span class="bar-val">' + d.predicted_rsrp.toFixed(1) + '</span></div>';
+      o += '</div>';
+    }
+
+    // Features
+    o += '<div class="row divider">Features</div>';
+    o += '<div class="row"><span class="k">Nearest Tower</span><span class="v">' + fmt(d.avg_distance_to_nearest_tower) + ' m</span></div>';
+    o += '<div class="row"><span class="k">Tower Density</span><span class="v">' + fmt(d.avg_tower_count_within_500m, 0) + ' / 500m</span></div>';
+    o += '<div class="row"><span class="k">Network</span><span class="v">' + (d.network_type || '--') + '</span></div>';
+    o += '<div class="row"><span class="k">Tower Type</span><span class="v">' + (d.tower_type || '--') + '</span></div>';
+    o += '<div class="row"><span class="k">Freq Band</span><span class="v">' + (d.freq_band || '--') + '</span></div>';
+    o += '<div class="row"><span class="k">WiFi RSSI</span><span class="v">' + fmt(d.avg_wifi_rssi) + ' dBm</span></div>';
+    o += '<div class="row"><span class="k">Measurements</span><span class="v">' + (d.measurement_count || '--') + '</span></div>';
+    o += '</div>';
+  }
+
+  // Towers
+  o += '<div class="sec">Cell Towers</div><div class="towers">';
+  for (const t of S.towers) {
+    const dotCls = t.tower_type === 'macro' ? 'Macro' : 'Small';
+    o += '<div class="tw"><div class="tw-dot ' + dotCls + '"></div><div style="flex:1">';
+    o += '<div class="tw-name">Tower ' + t.tower_id + '</div>';
+    o += '<div class="tw-meta">' + t.tower_type + ' | ' + t.freq_band + ' | ' + t.tower_lat.toFixed(4) + ', ' + t.tower_lon.toFixed(4) + '</div>';
+    o += '</div></div>';
+  }
+  o += '</div>';
+
+  el.innerHTML = o;
+
+  const btn = document.getElementById('btn-predict');
+  if (btn) btn.addEventListener('click', handlePredictRemaining);
+}
+
+// ===================================================================
+// Data loading & predictions
+// ===================================================================
+async function loadData() {
+  try {
+    const [hr, tr] = await Promise.all([fetch('/api/hexes'), fetch('/api/towers')]);
+    if (!hr.ok) throw new Error('Hex fetch failed: ' + hr.status);
+    if (!tr.ok) throw new Error('Tower fetch failed: ' + tr.status);
+    const hd = await hr.json();
+    const td = await tr.json();
+    S.hexes = hd.hexes;
+    S.towers = td.towers;
+    S.loading = false;
+  } catch (e) {
+    S.loading = false;
+    S.error = e.message || 'Failed to load data';
+  }
+
+  document.getElementById('load-overlay').style.display = 'none';
+  renderSidebar();
+  updateLayers();
+}
+
+async function handlePredictRemaining() {
+  // Predict all hexes that don't have predictions yet
+  const unpredicted = S.hexes.filter(h => h.predicted_rsrp == null);
+  if (!unpredicted.length) return;
+
+  S.predicting = true;
+  S.error = null;
+  renderSidebar();
+  document.getElementById('pred-overlay').style.display = 'flex';
+
+  try {
+    const h3s = unpredicted.map(h => h.h3_hex);
+    const res = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ h3_indices: h3s }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.detail || 'Prediction failed: ' + res.status);
+    }
+    const data = await res.json();
+    // Merge predictions back into hex data
+    for (let i = 0; i < unpredicted.length; i++) {
+      if (data.predictions[i] != null) {
+        unpredicted[i].predicted_rsrp = Math.round(data.predictions[i] * 100) / 100;
+      }
+    }
+  } catch (e) {
+    S.error = e.message || 'Prediction failed';
+  }
+
+  S.predicting = false;
+  document.getElementById('pred-overlay').style.display = 'none';
+  renderSidebar();
+  updateLayers();
+}
+
+async function handleHexClick(hexObj) {
+  // If already predicted, just select it
+  if (hexObj.predicted_rsrp != null) {
+    S.selectedHex = hexObj;
+    renderSidebar();
+    return;
+  }
+
+  // Otherwise call the serving endpoint for this single hex
+  S.predicting = true;
+  S.error = null;
+  renderSidebar();
+  document.getElementById('pred-overlay').style.display = 'flex';
+
+  try {
+    const res = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ h3_indices: [hexObj.h3_hex] }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.detail || 'Prediction failed: ' + res.status);
+    }
+    const data = await res.json();
+    if (data.predictions && data.predictions.length > 0 && data.predictions[0] != null) {
+      hexObj.predicted_rsrp = Math.round(data.predictions[0] * 100) / 100;
+    }
+    S.selectedHex = hexObj;
+  } catch (e) {
+    S.error = e.message || 'Prediction failed';
+  }
+
+  S.predicting = false;
+  document.getElementById('pred-overlay').style.display = 'none';
+  renderSidebar();
+  updateLayers();
+}
+
+// ===================================================================
+// Boot
+// ===================================================================
+initMap();
+loadData();
+</script>
+</body>
+</html>

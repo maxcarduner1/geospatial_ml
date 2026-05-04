@@ -3,8 +3,9 @@
 # MAGIC ## 02 — Train LightGBM Model with Feature Store
 # MAGIC
 # MAGIC Uses the **Feature Engineering client** to build a training set from the `signal_features`
-# MAGIC feature table, trains a `LGBMRegressor`, and logs the model with `fe.log_model()` so that
-# MAGIC feature lookup metadata is packaged with the model for downstream scoring and serving.
+# MAGIC feature table (keyed by `h3_index`), trains a `LGBMRegressor` to predict hex-level RSRP,
+# MAGIC and logs the model with `fe.log_model()` so that feature lookup metadata is packaged
+# MAGIC with the model for downstream scoring and serving.
 
 # COMMAND ----------
 
@@ -57,42 +58,42 @@ fe = FeatureEngineeringClient()
 feature_cols = [
     "latitude",
     "longitude",
-    "h3_index",
-    "distance_to_nearest_tower",
-    "nearest_tower_type_enc",
-    "nearest_tower_freq_band_enc",
-    "tower_count_within_500m",
-    "network_type_enc",
-    "hour_of_day",
-    "day_of_week",
-    "wifi_rssi_filled",
+    "avg_distance_to_nearest_tower",
+    "dominant_tower_type_enc",
+    "dominant_freq_band_enc",
+    "avg_tower_count_within_500m",
+    "dominant_network_type_enc",
+    "avg_hour_of_day",
+    "avg_day_of_week",
+    "avg_wifi_rssi",
+    "measurement_count",
 ]
 
 feature_lookups = [
     FeatureLookup(
         table_name=FEATURE_TABLE,
         feature_names=feature_cols,
-        lookup_key="signal_id",
+        lookup_key="h3_index",
     )
 ]
 
 # COMMAND ----------
 
-# Load training observations (signal_id + rsrp, filtered to train split)
+# Load training observations (h3_index + avg_rsrp, filtered to train split)
 train_obs_df = (
     spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_observations")
     .filter("split = 'train'")
-    .select("signal_id", "rsrp")
+    .select("h3_index", "avg_rsrp")
 )
 
-print(f"Training observations: {train_obs_df.count():,}")
+print(f"Training hexes: {train_obs_df.count():,}")
 
 # Create training set — auto-joins features from feature table
 training_set = fe.create_training_set(
     df=train_obs_df,
     feature_lookups=feature_lookups,
-    label="rsrp",
-    exclude_columns=["signal_id"],
+    label="avg_rsrp",
+    exclude_columns=["h3_index"],
 )
 
 training_pdf = training_set.load_df().toPandas()
@@ -106,7 +107,7 @@ display(training_set.load_df().limit(5))
 # COMMAND ----------
 
 X = training_pdf[feature_cols]
-y = training_pdf["rsrp"]
+y = training_pdf["avg_rsrp"]
 
 print(f"Feature matrix: {X.shape}")
 print(f"Target stats:\n{y.describe()}")
@@ -136,7 +137,7 @@ from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import numpy as np
 
-with mlflow.start_run(run_name="lightgbm_signal_strength_fe") as run:
+with mlflow.start_run(run_name="lightgbm_hex_rsrp") as run:
 
     # --- Model definition ---
     model = LGBMRegressor(
@@ -174,8 +175,6 @@ with mlflow.start_run(run_name="lightgbm_signal_strength_fe") as run:
     mlflow.log_metric("val_r2", r2)
 
     # --- Log model with Feature Engineering client ---
-    # This packages feature lookup metadata with the model so that
-    # fe.score_batch() and serving endpoints can auto-retrieve features.
     fe.log_model(
         model=model,
         artifact_path="model",
@@ -227,9 +226,9 @@ display(spark.createDataFrame(importance_df))
 # MAGIC | Item | Value |
 # MAGIC |------|-------|
 # MAGIC | Model | LightGBM Regressor |
-# MAGIC | Target | RSRP signal strength (dBm) |
+# MAGIC | Target | Average RSRP per H3 res-10 hex (dBm) |
 # MAGIC | Logged with | `fe.log_model()` (Feature Engineering client) |
-# MAGIC | Feature Table | `signal_features` (auto-lookup at scoring/serving) |
+# MAGIC | Feature Table | `signal_features` keyed by `h3_index` |
 # MAGIC | Registry | Unity Catalog |
 # MAGIC | Model Name | `cmegdemos_catalog.geospatial_analytics.signal_strength_predictor` |
 # MAGIC | Alias | Champion |

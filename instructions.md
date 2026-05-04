@@ -11,3 +11,4 @@ use databricks asset bundles
 resources:
 https://mlflow.org/docs/latest/api_reference/python_api/mlflow.lightgbm.html
 https://docs.databricks.com/aws/en/machine-learning/model-serving/create-manage-serving-endpoints
+https://docs.databricks.com/aws/en/machine-learning/feature-store/train-models-with-feature-store

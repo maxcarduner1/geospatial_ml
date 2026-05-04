@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC Because the model carries feature lookup metadata, the endpoint automatically
 # MAGIC retrieves features from the online store — the request only needs the lookup key
-# MAGIC (`signal_id`).
+# MAGIC (`h3_index`).
 # MAGIC
 # MAGIC **Run this notebook interactively** — it is not part of the DAB job pipeline.
 
@@ -53,11 +53,10 @@ print(f"Online store: {online_store.name} (state: {online_store.state})")
 # MAGIC %md ### 2. Publish feature table to the online store
 # MAGIC
 # MAGIC `publish_table()` syncs the `signal_features` Delta table to the online store.
-# MAGIC TRIGGERED mode performs an incremental sync (requires Change Data Feed).
 
 # COMMAND ----------
 
-ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.signal_features_online"
+ONLINE_TABLE_NAME = f"{CATALOG}.{SCHEMA}.signal_hex_features_online"
 
 fe.publish_table(
     online_store=online_store,
@@ -66,7 +65,7 @@ fe.publish_table(
     publish_mode="SNAPSHOT",
 )
 
-print(f"Published '{FEATURE_TABLE}' → '{ONLINE_TABLE_NAME}' (SNAPSHOT mode)")
+print(f"Published '{FEATURE_TABLE}' -> '{ONLINE_TABLE_NAME}' (SNAPSHOT mode)")
 
 # COMMAND ----------
 
@@ -74,7 +73,7 @@ print(f"Published '{FEATURE_TABLE}' → '{ONLINE_TABLE_NAME}' (SNAPSHOT mode)")
 # MAGIC
 # MAGIC Deploys the **Champion** model version — the one logged with `fe.log_model()`.
 # MAGIC Because feature lookup metadata is embedded in the model, the serving endpoint
-# MAGIC automatically retrieves features from the online store using `signal_id`.
+# MAGIC automatically retrieves features from the online store using `h3_index`.
 
 # COMMAND ----------
 
@@ -111,12 +110,12 @@ if existing:
         served = ep.config.served_entities or []
         current_versions = [e.entity_version for e in served]
         if champion_version in current_versions:
-            print(f"Endpoint '{ENDPOINT_NAME}' already serving Champion v{champion_version} — skipping update")
+            print(f"Endpoint '{ENDPOINT_NAME}' already serving Champion v{champion_version} -- skipping update")
             needs_update = False
 
 if needs_update:
     if existing:
-        print(f"Endpoint '{ENDPOINT_NAME}' exists — updating to Champion v{champion_version}...")
+        print(f"Endpoint '{ENDPOINT_NAME}' exists -- updating to Champion v{champion_version}...")
         w.serving_endpoints.update_config(
             name=ENDPOINT_NAME,
             served_entities=[
@@ -133,6 +132,7 @@ if needs_update:
         w.serving_endpoints.create(
             name=ENDPOINT_NAME,
             config=EndpointCoreConfigInput(
+                name=ENDPOINT_NAME,
                 served_entities=[
                     ServedEntityInput(
                         entity_name=MODEL_NAME,
@@ -167,49 +167,55 @@ def wait_for_endpoint(w, endpoint_name, timeout_minutes=30):
         time.sleep(30)
     raise TimeoutError(f"Endpoint not ready after {timeout_minutes} minutes")
 
-endpoint = wait_for_endpoint(w, ENDPOINT_NAME)
+if needs_update:
+    endpoint = wait_for_endpoint(w, ENDPOINT_NAME)
+else:
+    print(f"Endpoint already ready -- skipping wait")
 
 # COMMAND ----------
 
 # MAGIC %md ### 5. Query the serving endpoint
 # MAGIC
 # MAGIC The model was logged with `fe.log_model()` and features are published to the
-# MAGIC online store. The request only needs the **lookup key** (`signal_id`) — the
+# MAGIC online store. The request only needs the **lookup key** (`h3_index`) — the
 # MAGIC endpoint automatically retrieves all features.
 
 # COMMAND ----------
 
 from databricks.sdk.service.serving import DataframeSplitInput
 
-# Get a few real signal_ids from the holdout set for testing
-holdout_ids = (
+# Get a few real h3_index values from the holdout set for testing
+holdout_hexes = (
     spark.table(f"`{CATALOG}`.`{SCHEMA}`.signal_observations")
     .filter("split = 'holdout'")
-    .select("signal_id")
-    .limit(3)
+    .select("h3_index", "avg_rsrp")
+    .limit(5)
     .toPandas()
 )
 
-signal_id_list = holdout_ids["signal_id"].values.tolist()
-print(f"Querying with signal_ids: {signal_id_list}")
+h3_list = holdout_hexes["h3_index"].values.tolist()
+print(f"Querying {len(h3_list)} holdout hexes")
 
 response = w.serving_endpoints.query(
     name=ENDPOINT_NAME,
     dataframe_split=DataframeSplitInput(
-        columns=["signal_id"],
-        data=[[sid] for sid in signal_id_list],
+        columns=["h3_index"],
+        data=[[h3] for h3 in h3_list],
     ),
 )
 
-print("\nPredictions:")
-print(response.predictions)
+print("\nPredicted vs Actual RSRP:")
+for i, h3 in enumerate(h3_list):
+    actual = holdout_hexes["avg_rsrp"].iloc[i]
+    predicted = response.predictions[i]
+    print(f"  Hex {h3}: predicted={predicted:.2f} dBm, actual={actual:.2f} dBm")
 
 # COMMAND ----------
 
 # MAGIC %md ### 6. Query using REST API (alternative)
 # MAGIC
 # MAGIC Shows how to call the endpoint from any HTTP client outside of Databricks.
-# MAGIC Note: only the lookup key (`signal_id`) is required — features are auto-looked up.
+# MAGIC Only the lookup key (`h3_index`) is required — features are auto-looked up.
 
 # COMMAND ----------
 
@@ -220,8 +226,8 @@ token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiTok
 
 curl_payload = {
     "dataframe_split": {
-        "columns": ["signal_id"],
-        "data": [[sid] for sid in signal_id_list],
+        "columns": ["h3_index"],
+        "data": [[h3] for h3 in h3_list],
     }
 }
 
@@ -247,10 +253,10 @@ print(f"""curl -X POST \\
 # MAGIC | Item | Value |
 # MAGIC |------|-------|
 # MAGIC | Endpoint Name | `signal-strength-predictor` |
-# MAGIC | Model | `cmegdemos_catalog.geospatial_analytics.signal_strength_predictor` @ Champion |
+# MAGIC | Model | `signal_strength_predictor` @ Champion |
 # MAGIC | Logged with | `fe.log_model()` — auto feature lookup enabled |
 # MAGIC | Online Store | Lakebase Autoscaling instance |
 # MAGIC | Online Table | `signal_features_online` (synced from `signal_features`) |
-# MAGIC | Request Payload | `signal_id` only — features retrieved automatically |
+# MAGIC | Request Payload | `h3_index` only — features retrieved automatically |
 # MAGIC | Workload Size | Small |
 # MAGIC | Scale to Zero | Enabled |
